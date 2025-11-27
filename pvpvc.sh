@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Benchmark Kubernetes PVC creation and binding performance, as a proxy for
-# PrepareData-like workspace preparation using PV/PVCs.
+# Benchmark Kubernetes PV/PVC creation and binding performance using
+# static provisioning (PV + PVC pairs).
 #
 # For each "num_pvcs" value, the script:
 #   - Repeats the experiment N_RUNS times.
 #   - In each run:
-#       * Creates that many PVCs in the target namespace using the given
-#         StorageClass and size.
+#       * Creates 'num_pvcs' PVs with hostPath and matching PVCs.
+#       * Each PVC references its PV via 'volumeName'.
 #       * Waits until ALL PVCs reach the 'Bound' phase (or timeout).
 #       * Measures:
 #           - Total wall-clock time for the run.
@@ -22,14 +22,15 @@ set -euo pipefail
 #     avg_sys_cpu_fraction = avg_sys_cpu_seconds / avg_total_time_seconds
 #
 # Usage:
-#   ./pvc_preparedata_benchmark.sh NAMESPACE STORAGE_CLASS PVC_SIZE
+#   ./pvc_preparedata_benchmark.sh NAMESPACE PVC_SIZE
 #
 #   Example:
-#     ./pvc_preparedata_benchmark.sh pd-bench sc-cephfs 1Gi
+#     ./pvc_preparedata_benchmark.sh pd-bench 1Gi
 #
 # Notes:
+#   - Uses static PVs with hostPath. This avoids relying on any StorageClass
+#     or dynamic provisioner, making the binding behaviour deterministic.
 #   - Requires 'kubectl' configured with access to the target cluster/namespace.
-#   - Requires a valid StorageClass name.
 #   - PVC_SIZE must be a valid Kubernetes quantity (e.g. 1Gi, 512Mi, 10Gi, ...).
 #
 # Requirements:
@@ -46,7 +47,7 @@ set -euo pipefail
 # Number of repetitions per "num_pvcs" scenario
 N_RUNS=5
 
-# Different numbers of PVCs to test per run (tune as needed)
+# Different numbers of PV/PVC pairs to test per run (tune as needed)
 NUM_PVCS_LIST=(5 10 20 50 100)
 
 # Timeout waiting for each PVC to become Bound (e.g. "300s")
@@ -57,11 +58,10 @@ PVC_TIMEOUT="300s"
 ########################
 
 usage() {
-    echo "Usage: $0 NAMESPACE STORAGE_CLASS PVC_SIZE"
+    echo "Usage: $0 NAMESPACE PVC_SIZE"
     echo
-    echo "NAMESPACE:      Kubernetes namespace where PVCs will be created."
-    echo "STORAGE_CLASS:  StorageClass name to use for the PVCs."
-    echo "PVC_SIZE:       Size of each PVC (e.g. 1Gi, 512Mi)."
+    echo "NAMESPACE:  Kubernetes namespace where PVCs will be created."
+    echo "PVC_SIZE:   Size of each PVC (e.g. 1Gi, 512Mi)."
     exit 1
 }
 
@@ -93,13 +93,12 @@ EOF
 # Argument parsing and checks
 ################################
 
-if [[ $# -ne 3 ]]; then
+if [[ $# -ne 2 ]]; then
     usage
 fi
 
 NAMESPACE=$1
-STORAGE_CLASS=$2
-PVC_SIZE=$3
+PVC_SIZE=$2
 
 check_dependencies
 
@@ -124,42 +123,65 @@ echo "num_pvcs; avg_total_time_seconds; avg_user_cpu_seconds; avg_sys_cpu_second
 
 for num_pvcs in "${NUM_PVCS_LIST[@]}"; do
     echo "----------------------------------------"
-    echo "Testing scenario with ${num_pvcs} PVCs..."
+    echo "Testing scenario with ${num_pvcs} PV/PVC pairs..."
 
     total_wall_time="0"
     total_user_time="0"
     total_sys_time="0"
 
     for (( run=1; run<=N_RUNS; run++ )); do
-        echo "  Run ${run}/${N_RUNS} for ${num_pvcs} PVCs..."
+        echo "  Run ${run}/${N_RUNS} for ${num_pvcs} PV/PVC pairs..."
 
-        # Prefix to generate unique PVC names for this run
+        # Prefix to generate unique PVC and PV names for this run
         pvc_name_prefix="pvcbench-${num_pvcs}-${run}-"
+        pv_name_prefix="pvbench-${num_pvcs}-${run}-"
 
         # Temporary file to store /usr/bin/time output (user;system)
         tmp_time_file=$(mktemp)
 
-        # Measure wall-clock time around the PVC storm
+        # Measure wall-clock time around the PV/PVC storm
         start_s=$(now_seconds)
 
-        # Run the PVC storm in a child shell, measured by /usr/bin/time
+        # Run the PV/PVC storm in a child shell, measured by /usr/bin/time
         /usr/bin/time -f "%U;%S" -o "$tmp_time_file" \
             bash -c '
                 num_pvcs="$1"
                 ns="$2"
-                sc="$3"
-                size="$4"
-                prefix="$5"
+                size="$3"
+                pvc_prefix="$4"
+                pv_prefix="$5"
                 timeout="$6"
 
-                # 1) Create PVCs
+                # 1) Create PVs and PVCs
                 for i in $(seq 1 "$num_pvcs"); do
-                    name="${prefix}${i}"
+                    pvc_name="${pvc_prefix}${i}"
+                    pv_name="${pv_prefix}${i}"
+                    hostpath="/tmp/${pv_name}"
+
+                    # Create PV (static, hostPath)
+                    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${pv_name}
+spec:
+  capacity:
+    storage: ${size}
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  volumeMode: Filesystem
+  hostPath:
+    path: ${hostpath}
+  storageClassName: ""
+EOF
+
+                    # Create PVC bound to that PV via volumeName
                     cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: ${name}
+  name: ${pvc_name}
   namespace: ${ns}
 spec:
   accessModes:
@@ -167,17 +189,18 @@ spec:
   resources:
     requests:
       storage: ${size}
-  storageClassName: ${sc}
+  storageClassName: ""
+  volumeName: ${pv_name}
 EOF
                 done
 
                 # 2) Wait for all PVCs to be Bound
                 for i in $(seq 1 "$num_pvcs"); do
-                    name="${prefix}${i}"
-                    echo "      waiting for pvc/${name} to be Bound..."
-                    kubectl -n "$ns" wait --for=condition=Bound --timeout="$timeout" "pvc/${name}"
+                    pvc_name="${pvc_prefix}${i}"
+                    echo "      waiting for pvc/${pvc_name} to be Bound..."
+                    kubectl -n "$ns" wait --for=condition=Bound --timeout="$timeout" "pvc/${pvc_name}"
                 done
-            ' bash "$num_pvcs" "$NAMESPACE" "$STORAGE_CLASS" "$PVC_SIZE" "$pvc_name_prefix" "$PVC_TIMEOUT"
+            ' bash "$num_pvcs" "$NAMESPACE" "$PVC_SIZE" "$pvc_name_prefix" "$pv_name_prefix" "$PVC_TIMEOUT"
 
         end_s=$(now_seconds)
 
@@ -196,11 +219,14 @@ EOF
         total_user_time=$(echo "scale=6; $total_user_time + $user_time_run" | bc)
         total_sys_time=$(echo "scale=6; $total_sys_time + $sys_time_run" | bc)
 
-        # 3) Cleanup: delete PVCs from this run
-        echo "    Cleaning up PVCs for this run..."
+        # 3) Cleanup: delete PVCs and PVs from this run
+        echo "    Cleaning up PVs and PVCs for this run..."
         for i in $(seq 1 "$num_pvcs"); do
-            name="${pvc_name_prefix}${i}"
-            kubectl -n "$NAMESPACE" delete pvc "$name" --ignore-not-found=true >/dev/null 2>&1 || true
+            pvc_name="${pvc_name_prefix}${i}"
+            pv_name="${pv_name_prefix}${i}"
+
+            kubectl -n "$NAMESPACE" delete pvc "$pvc_name" --ignore-not-found=true >/dev/null 2>&1 || true
+            kubectl delete pv "$pv_name" --ignore-not-found=true >/dev/null 2>&1 || true
         done
     done
 
@@ -221,5 +247,5 @@ EOF
 done
 
 echo "----------------------------------------"
-echo "PVC PrepareData-like benchmark finished."
+echo "PVC PrepareData-like static PV/PVC benchmark finished."
 echo "Results saved to: ${RESULTS_FILE}"
